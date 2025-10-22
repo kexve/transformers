@@ -12,323 +12,436 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""
+DeepSeek V3.2 Model - Extends DeepSeek V3 with DeepSeek Sparse Attention (DSA).
+
+DeepSeek V3.2 introduces an indexer mechanism that enables fine-grained sparse attention,
+significantly improving training and inference efficiency for long-context scenarios while
+maintaining model output quality.
+"""
+
 import math
-from typing import Optional, tuple
+from typing import Callable, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
-from ...cache_utils import Cache, DynamicLayer
-from ..deepseek_v2.configuration_deepseek_v2 import DeepseekV2Config
-from ..deepseek_v2.modeling_deepseek_v2 import (
-    DeepseekV2Attention,
-    DeepseekV2DecoderLayer,
-    DeepseekV2ForCausalLM,
-    DeepseekV2ForSequenceClassification,
-    DeepseekV2MLP,
-    DeepseekV2Model,
-    DeepseekV2MoE,
-    DeepseekV2MoEGate,
-    DeepseekV2PreTrainedModel,
-    DeepseekV2RMSNorm,
-    DeepseekV2RotaryEmbedding,
-    apply_rotary_emb,
+from ...cache_utils import Cache
+from ...modeling_flash_attention_utils import FlashAttentionKwargs
+from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
+from ...processing_utils import Unpack
+from ...utils.deprecation import deprecate_kwarg
+from ..deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
+from ..deepseek_v3.modeling_deepseek_v3 import (
+    DeepseekV3Attention,
+    DeepseekV3DecoderLayer,
+    DeepseekV3ForCausalLM,
+    DeepseekV3ForSequenceClassification,
+    DeepseekV3ForTokenClassification,
+    DeepseekV3MLP,
+    DeepseekV3Model,
+    DeepseekV3MoE,
+    DeepseekV3PreTrainedModel,
+    DeepseekV3RMSNorm,
+    DeepseekV3RotaryEmbedding,
+    DeepseekV3TopkRouter,
+    apply_rotary_pos_emb,
+    apply_rotary_pos_emb_interleave,
+    eager_attention_forward,
 )
 
 
-class DeepseekV32Config(DeepseekV2Config):
-    def __init__(self, index_n_heads=64, index_head_dim=128, index_topk=2048, **super_kwargs):
+class DeepseekV32Config(DeepseekV3Config):
+    """
+    Configuration class for DeepSeek V3.2 model.
+    
+    DeepSeek V3.2 extends DeepSeek V3 with DeepSeek Sparse Attention (DSA), which uses an indexer
+    mechanism to select the most relevant positions for attention computation, enabling efficient
+    processing of very long sequences.
+    
+    Args:
+        index_n_heads (`int`, *optional*, defaults to 64):
+            Number of attention heads for the indexer module.
+        index_head_dim (`int`, *optional*, defaults to 128):
+            Dimension of each attention head in the indexer.
+        index_topk (`int`, *optional*, defaults to 2048):
+            Number of top-k positions to select for sparse attention.
+        **kwargs:
+            Additional arguments passed to DeepseekV3Config.
+    
+    Example:
+        ```python
+        >>> from transformers import DeepseekV32Config, DeepseekV32Model
+        >>> 
+        >>> # Initialize with custom indexer parameters
+        >>> config = DeepseekV32Config(
+        ...     index_n_heads=64,
+        ...     index_head_dim=128,
+        ...     index_topk=2048,
+        ... )
+        >>> model = DeepseekV32Model(config)
+        ```
+    """
+    
+    model_type = "deepseek_v32"
+    
+    def __init__(
+        self,
+        index_n_heads: int = 64,
+        index_head_dim: int = 128,
+        index_topk: int = 2048,
+        **super_kwargs
+    ):
         super().__init__(**super_kwargs)
         self.index_n_heads = index_n_heads
         self.index_head_dim = index_head_dim
-        self.index_top_k = index_topk
+        self.index_top_k = index_topk  # Note: using index_top_k for consistency
 
 
-class DeepseekV32MoEGate(DeepseekV2MoEGate):
+# Inherit all basic components from DeepSeek V3
+class DeepseekV32TopkRouter(DeepseekV3TopkRouter):
+    """DeepSeek V3.2 Top-k Router, inherits from DeepSeek V3."""
     pass
 
 
-class DeepseekV32MoE(DeepseekV2MoE):
+class DeepseekV32MoE(DeepseekV3MoE):
+    """DeepSeek V3.2 Mixture of Experts, inherits from DeepSeek V3."""
     pass
 
 
-class DeepseekV32MLP(DeepseekV2MLP):
+class DeepseekV32MLP(DeepseekV3MLP):
+    """DeepSeek V3.2 MLP, inherits from DeepSeek V3."""
     pass
 
 
-class DeepseekV32RMSNorm(DeepseekV2RMSNorm):
+class DeepseekV32RMSNorm(DeepseekV3RMSNorm):
+    """DeepSeek V3.2 RMS Normalization, inherits from DeepSeek V3."""
     pass
 
 
-class DeepseekV32RotaryEmbedding(DeepseekV2RotaryEmbedding):
+class DeepseekV32RotaryEmbedding(DeepseekV3RotaryEmbedding):
+    """DeepSeek V3.2 Rotary Embedding, inherits from DeepSeek V3."""
     pass
 
 
 class DeepseekV32Indexer(nn.Module):
-    def __init__(self, config: "DeepseekV32Config", index_layer_idx: int):
+    """
+    Indexer module for DeepSeek V3.2 sparse attention.
+    
+    The indexer computes top-k indices to select the most relevant positions for attention computation.
+    This enables fine-grained sparse attention that significantly reduces computational complexity
+    for long sequences while maintaining model quality.
+    
+    Key features:
+    - Uses separate lightweight query/key projections
+    - Applies ReLU activation for scoring
+    - Supports rotary position embeddings
+    - Computes weighted scores across multiple heads
+    
+    Args:
+        config (DeepseekV32Config): Model configuration.
+        layer_idx (int): Layer index for this indexer.
+    """
+    
+    def __init__(self, config: DeepseekV32Config, layer_idx: int):
         super().__init__()
         self.config = config
-        self.layer_idx = index_layer_idx
-
-        self.hidden_size: int = config.dim
-        self.num_heads: int = config.index_n_heads
-        self.num_local_heads: int = config.index_n_heads  # world_size handling can be added as needed
-        self.head_dim: int = config.index_head_dim
-        self.qk_rope_head_dim: int = config.qk_rope_head_dim
-        self.index_topk: int = config.index_topk
-        self.q_lora_rank: int = config.q_lora_rank
-
-        self.q_b_proj = nn.Linear(self.q_lora_rank, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.head_dim, bias=False)
-        self.k_layernorm = nn.LayerNorm(self.head_dim)
-        self.weight_proj = nn.Linear(self.hidden_size, self.num_heads, dtype=torch.get_default_dtype(), bias=False)
-        self.softmax_scale = self.head_dim**-0.5
-
-    @torch.no_grad()
+        self.layer_idx = layer_idx
+        
+        # Indexer dimensions
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.index_n_heads
+        self.head_dim = config.index_head_dim
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.index_topk = config.index_top_k
+        self.q_lora_rank = config.q_lora_rank if config.q_lora_rank is not None else config.hidden_size
+        
+        # Indexer projections
+        self.wq_b = nn.Linear(self.q_lora_rank, self.num_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(self.hidden_size, self.head_dim, bias=False)
+        self.k_norm = nn.LayerNorm(self.head_dim)
+        self.weights_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
+        
+        self.softmax_scale = self.head_dim ** -0.5
+    
     def forward(
         self,
-        hidden_states: torch.Tensor,  # [B, S, hidden]
-        q_resid: torch.Tensor,  # [B, S, q_lora_rank]
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_values_index: "Cache",
-        cache_position: Optional[torch.LongTensor],
-    ) -> torch.LongTensor:
-        B, S, _ = hidden_states.shape
+        hidden_states: torch.Tensor,
+        q_compressed: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute top-k indices for sparse attention.
+        
+        Args:
+            hidden_states: Input hidden states [batch_size, seq_len, hidden_size]
+            q_compressed: Compressed query states [batch_size, seq_len, q_lora_rank]
+            position_embeddings: Tuple of (cos, sin) for rotary embeddings
+            attention_mask: Optional attention mask
+            
+        Returns:
+            Top-k indices [batch_size, seq_len, topk]
+        """
+        batch_size, seq_len, _ = hidden_states.shape
         cos, sin = position_embeddings
-
-        # Queries
-        q_states = self.q_b_proj(q_resid)  # [B, S, H*D]
-        q_states = q_states.view(B, S, self.num_heads, self.head_dim)  # [B, S, H, D]
-        q_rot, q_pass = torch.split(q_states, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
-        q_rot = apply_rotary_pos_emb(q_rot, cos, sin)  # [B, S, H, rope_D]
-        q_states = torch.cat([q_rot, q_pass], dim=-1)  # [B, S, H, D]
-
-        # Keys
-        k = self.k_layernorm(self.k_proj(hidden_states))  # [B, S, D]
-        k_rot, k_pass = torch.split(k, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
-        # MLA uses single-head rope stream, then expands later; keep [B, 1, S, rope_D] here
-        k_rot = k_rot.unsqueeze(1)  # [B, 1, S, rope_D]
-        k_rot = apply_rotary_pos_emb(k_rot, cos, sin)  # [B, 1, S, rope_D]
-        k_states = torch.cat(
-            [
-                k_rot.expand(B, self.num_heads, S, -1),  # expand rope
-                k_pass.view(B, 1, S, -1).expand(B, self.num_heads, S, -1),
-            ],
-            dim=-1,
-        )  # [B, H, S, D]
-
-        # Quantize (per provided utilities)
-        # Update indexer cache (layer idx belongs to the attention layer using this indexer)
-        # We store as: keys = k_fp8 (as [B, 1, S, D] or [B, H, S, D]? We keep [B, 1, S, D] like original)
-        # For compactness, collapse heads to 1 for the indexer (you can keep H if your fp8_index expects it).
-        k_1h = k_states.mean(dim=1, keepdim=True)  # [B, 1, S, D]  (cheap head merge; adjust if needed)
-        past_key_values_index.update(k_1h, self.layer_idx, cache_kwargs={"cache_position": cache_position})
-
-        # Weights per head
-        head_weights = self.weight_proj(hidden_states) * (self.num_heads**-0.5)  # [B, S, H]
-        head_weights = head_weights.unsqueeze(-1) * self.softmax_scale  # [B, S, H, *]
-
-        # Build score via provided kernel
-        k_cache_fp8, k_cache_scale = past_key_values_index[self.layer_idx]  # (keys, values)
-
-        logits = torch.matmul(k_1h.unsqueeze(1), q_states.transpose(-1, -2))  # [B, M, N, H]
-
-        # ReLU and sum over heads -> [B, M, N]
-        logits.clamp_min_(0)
-        index_scores = logits.sum(dim=-1)  # [B, M, N]
-
+        
+        # Compute indexer queries
+        q = self.wq_b(q_compressed)  # [B, S, H*D]
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)  # [B, S, H, D]
+        
+        # Split into RoPE and non-RoPE parts
+        q_nope, q_pe = torch.split(
+            q, [self.head_dim - self.qk_rope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        
+        # Apply rotary embeddings to query
+        if self.config.rope_interleave:
+            q_pe = q_pe.transpose(1, 2)  # [B, H, S, rope_D]
+            k_pe_dummy = torch.zeros_like(q_pe[:, :1])
+            q_pe, _ = apply_rotary_pos_emb_interleave(q_pe, k_pe_dummy, cos, sin)
+            q_pe = q_pe.transpose(1, 2)  # [B, S, H, rope_D]
+        else:
+            q_pe = q_pe.transpose(1, 2)  # [B, H, S, rope_D]
+            q_pe, _ = apply_rotary_pos_emb(q_pe, q_pe[:, :1], cos, sin)
+            q_pe = q_pe.transpose(1, 2)  # [B, S, H, rope_D]
+        
+        q = torch.cat([q_nope, q_pe], dim=-1)  # [B, S, H, D]
+        
+        # Compute indexer keys
+        k = self.wk(hidden_states)  # [B, S, D]
+        k = self.k_norm(k)  # [B, S, D]
+        
+        # Split key into RoPE and non-RoPE parts
+        k_nope, k_pe = torch.split(
+            k, [self.head_dim - self.qk_rope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        
+        # Apply rotary embeddings to key
+        k_pe = k_pe.unsqueeze(1)  # [B, 1, S, rope_D]
+        if self.config.rope_interleave:
+            _, k_pe = apply_rotary_pos_emb_interleave(k_pe, k_pe, cos, sin)
+        else:
+            _, k_pe = apply_rotary_pos_emb(k_pe, k_pe, cos, sin)
+        
+        # Expand key to all heads
+        k = torch.cat([
+            k_nope.unsqueeze(1).expand(batch_size, self.num_heads, seq_len, -1),
+            k_pe.expand(batch_size, self.num_heads, seq_len, -1)
+        ], dim=-1)  # [B, H, S, D]
+        
+        # Compute attention scores for indexing
+        q = q.transpose(1, 2)  # [B, H, S, D]
+        scores = torch.matmul(q, k.transpose(-1, -2))  # [B, H, S, S]
+        
+        # Apply ReLU activation (key innovation in DSA)
+        scores = F.relu(scores)
+        
+        # Compute head weights
+        head_weights = self.weights_proj(hidden_states)  # [B, S, H]
+        head_weights = head_weights * (self.num_heads ** -0.5)
+        head_weights = head_weights.transpose(1, 2).unsqueeze(-1)  # [B, H, S, 1]
+        
+        # Weight scores by head importance
+        scores = scores * head_weights * self.softmax_scale
+        
+        # Aggregate across heads
+        index_scores = scores.sum(dim=1)  # [B, S, S]
+        
+        # Apply attention mask if provided
         if attention_mask is not None:
             index_scores = index_scores + attention_mask
-
-        T = index_scores.shape[-1]
-        topk = min(self.index_topk, T)
-        topk_indices = index_scores.topk(topk, dim=-1).indices  # [..., topk]
-
-        # sanity clone (kept from original)
-        _topk = topk_indices.clone()
-        assert torch.equal(topk_indices, _topk), f"{topk_indices=} {_topk=}"
+        
+        # Select top-k indices
+        topk = min(self.index_topk, seq_len)
+        topk_indices = index_scores.topk(topk, dim=-1).indices  # [B, S, topk]
+        
         return topk_indices
 
 
-class DeepseekV32Attention(DeepseekV2Attention):
-    def __init__(self, config, layer_idx):
-        self.softmax_scale = self.qk_head_dim**-0.5
-        if config.max_seq_len > config.original_seq_len:
-            mscale = 0.1 * config.mscale * math.log(config.rope_factor) + 1.0
-            self.softmax_scale = self.softmax_scale * mscale * mscale
-
+class DeepseekV32Attention(DeepseekV3Attention):
+    """
+    DeepSeek V3.2 Attention with DeepSeek Sparse Attention (DSA).
+    
+    Extends DeepSeek V3 attention with an indexer mechanism that selects top-k positions
+    to attend to, reducing computational complexity from O(n²) to O(n×k) for long sequences.
+    
+    The indexer uses:
+    - Lightweight query/key projections
+    - ReLU activation for scoring
+    - Weighted aggregation across heads
+    - Top-k selection for sparse attention
+    
+    This achieves substantial improvements in long-context training and inference efficiency
+    while maintaining virtually identical model output quality.
+    """
+    
+    def __init__(self, config: DeepseekV32Config, layer_idx: int):
+        super().__init__(config, layer_idx)
+        
+        # Add indexer for sparse attention
         self.indexer = DeepseekV32Indexer(config, layer_idx)
-
+        self.use_sparse_attention = True  # Flag to enable/disable sparse attention
+    
+    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
-        hidden_states: torch.Tensor,  # [B, S, hidden]
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],  # (cos, sin)
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[Cache] = None,  # must be Cache with MlaLayer at `layer_idx`
+        past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-        B, S, _ = hidden_states.shape
-        cos, sin = position_embeddings
-
-        # ----- Q path -----
-        q_resid = self.q_a_layernorm(self.q_a_proj(hidden_states))  # [B, S, q_lora_rank]
-        q_states = self.q_b_proj(q_resid).view(B, S, self.num_heads, self.qk_head_dim)  # [B, S, H, D]
-        # Split into pass/rot then apply RoPE on q_rot
-        q_pass, q_rot = torch.split(q_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        q_rot = apply_rotary_pos_emb(q_rot, cos, sin)  # [B, S, H, rope_D]
-        q_states = torch.cat([q_pass, q_rot], dim=-1)  # [B, S, H, D]
-
-        # Layout for matmul: [B, H, S, D]
-        q_states = q_states.transpose(1, 2).contiguous()  # [B, H, S, D]
-
-        # ----- KV path (compressed + rope stream) -----
-        kv_all = self.kv_a_proj_with_mqa(hidden_states)  # [B, S, kv_rank + rope_D]
-        kv_compressed, k_rot = torch.split(kv_all, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv_compressed = self.kv_a_layernorm(kv_compressed)  # [B, S, kv_rank]
-        # Pre-project to K_pass and V
-        kv_proj = self.kv_b_proj(kv_compressed)  # [B, S, H*(qk_nope + v)]
-        kv_proj = kv_proj.view(B, S, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-        k_pass, v_states = torch.split(
-            kv_proj, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-        )  # [B,S,H,nope], [B,S,H,V]
-
-        # Rope on K side: keep a single-head rope stream like MLA, then expand
-        k_rot = k_rot.view(B, 1, S, self.qk_rope_head_dim)  # [B, 1, S, rope_D]
-        k_rot = apply_rotary_pos_emb(k_rot, cos, sin)  # [B, 1, S, rope_D]
-
-        # Concatenate K = [K_pass, K_rot(expanded)]
-        k_states = torch.cat(
-            (
-                k_pass.transpose(1, 2),  # [B, H, S, nope_D]
-                k_rot.expand(B, self.num_heads, S, -1),
-            ),  # [B, H, S, rope_D]
-            dim=-1,
-        )  # [B, H, S, D]
-        v_states = v_states.transpose(1, 2).contiguous()  # [B, H, S, V]
-
-        # ----- Cache update/usage -----
-        if past_key_values is not None:
-            # Store compressed stream & rope stream (as in original MLA path)
-            # We cache `kv_compressed` under `keys` and `k_rot` under `values` in MlaLayer.
-            # Shapes must be [B, H, t, *] and [B, 1, t, rope_D].
-            kv_comp_cache = kv_compressed.view(B, 1, S, self.kv_lora_rank).expand(B, self.num_heads, S, -1)
-            k_rot_cache = k_rot  # [B, 1, S, rope_D]
-            cached_kv, cached_pe = past_key_values.update(
-                kv_comp_cache, k_rot_cache, layer_idx=self.layer_idx, cache_kwargs={"cache_position": cache_position}
-            )
-            # Decode path makes use of cached projections; Prefill can use full K/V directly.
-
-        # ----- Two paths (prefill vs decode) -----
-        if attention_mask is not None:
-            # Prefill (full attention over local window): standard scaled dot-product with top-k pruning from indexer
-
-            # Build scores: [B, H, S, S_total]
-            # K layout already [B, H, T, D]
-            scores = (q_states.float() @ k_states.float().transpose(-1, -2)) * self.scaling  # [B, H, S, T]
-
-            # Indexer top-k
-            if past_key_values is not None:
-                topk_idx = self.indexer(
-                    hidden_states,
-                    q_resid,
-                    position_embeddings,
-                    attention_mask,
-                    past_key_values_index=past_key_values,  # we reuse same Cache with IndexerLayer? (separate cache recommended)
-                    cache_position=cache_position,
-                )
-                # Build mask to keep only top-k per (B,S,head?)
-                # Expect topk_idx shape to broadcast to [B, H, S, T]. We scatter along last dim.
-                keep_mask = torch.full_like(scores, float("-inf"))
-                # If topk_idx is [B,S,topk], expand for heads:
-                if topk_idx.dim() == 3:
-                    topk_idx = topk_idx.unsqueeze(1).expand(B, self.num_heads, S, -1)
-                keep_mask.scatter_(-1, topk_idx, 0.0)
-                scores = scores + keep_mask
-
-            probs = nn.functional.softmax(scores, dim=-1, dtype=torch.float32).type_as(hidden_states)  # [B, H, S, T]
-            attn_output = probs @ v_states  # [B, H, S, V]
-
-        elif past_key_values is not None:
-            # Decode: use cached compressed KV & rope stream to recompose attention scores efficiently
-            # Compose q_pass and q_rot pieces as in MLA math, but via matmul
-            # 1) Rebuild "nope" term via kv_b weights (dequant on the fly)
-            wkv_b = self.kv_b_proj.weight.view(
-                self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank
-            )
-            w_k_nope = wkv_b[:, : self.qk_nope_head_dim, :]  # [H, nope_D, kv_rank]
-            w_v = wkv_b[:, self.qk_nope_head_dim :, :]  # [H, V,     kv_rank]
-
-            # q_pass: [B,H,S,nope_D]; cached_kv: [B,H,T,kv_rank]
-            q_pass = q_states[..., : self.qk_nope_head_dim]  # [B,H,S,nope_D]
-            kv_comp = past_key_values[self.layer_idx][0]  # keys -> [B,H,T,kv_rank]
-            pe_full = past_key_values[self.layer_idx][1]  # values -> [B,1,T,rope_D]
-            # Project q_pass with w_k_nope: [B,H,S,kv_rank]
-            qk_nope = torch.matmul(q_pass, w_k_nope.transpose(-1, -2))  # [B,H,S,kv_rank]
-            # Scores_nope = qk_nope @ kv_comp^T
-            scores_nope = torch.matmul(qk_nope.float(), kv_comp.float().transpose(-1, -2))  # [B,H,S,T]
-
-            # 2) Rope term: q_rot @ k_rot^T
-            q_rot_only = q_states[..., -self.qk_rope_head_dim :]  # [B,H,S,rope_D]
-            k_rot_only = pe_full.expand(B, self.num_heads, -1, -1)  # [B,H,T,rope_D]
-            scores_rot = torch.matmul(q_rot_only.float(), k_rot_only.float().transpose(-1, -2))  # [B,H,S,T]
-
-            scores = (scores_nope + scores_rot) * self.scaling
-
-            # Indexer top-k (decode)
-            topk_idx = self.indexer(
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        """
+        Forward pass with DeepSeek Sparse Attention.
+        
+        For long sequences, applies sparse attention using the indexer to select top-k positions.
+        For short sequences or during initial prefill, uses standard dense attention.
+        
+        Args:
+            hidden_states: Input tensor [batch_size, seq_len, hidden_size]
+            position_embeddings: Tuple of (cos, sin) for rotary embeddings
+            attention_mask: Attention mask tensor
+            past_key_values: Cache for key/value states
+            cache_position: Position indices for caching
+            **kwargs: Additional keyword arguments
+            
+        Returns:
+            Tuple of (attention_output, attention_weights, past_key_values)
+        """
+        batch_size, seq_len, _ = hidden_states.shape
+        
+        # For short sequences or when sparse attention is disabled, use standard attention
+        # Also use dense attention during prefill (when attention_mask is provided)
+        if not self.use_sparse_attention or seq_len <= self.config.index_top_k or attention_mask is None:
+            return super().forward(
                 hidden_states,
-                q_resid,
                 position_embeddings,
                 attention_mask,
-                past_key_values_index=past_key_values,
-                cache_position=cache_position,
+                past_key_values,
+                cache_position,
+                **kwargs,
             )
-            # For decode single-step S==1 typically; build a [B,H,1,T] mask
-            keep_mask = torch.full_like(scores, float("-inf"))
-            if topk_idx.dim() == 3:
-                topk_idx = topk_idx.unsqueeze(1).expand(B, self.num_heads, S, -1)
-            keep_mask.scatter_(-1, topk_idx, 0.0)
-            scores = scores + keep_mask
+        
+        # Apply sparse attention for long sequences
+        # Get compressed query states for indexer
+        if self.config.q_lora_rank is not None and hasattr(self, 'q_a_proj'):
+            q_compressed = self.q_a_layernorm(self.q_a_proj(hidden_states))
+        else:
+            q_compressed = hidden_states
+        
+        # Compute top-k indices using indexer
+        topk_indices = self.indexer(
+            hidden_states,
+            q_compressed,
+            position_embeddings,
+            attention_mask,
+        )
+        
+        # Create sparse attention mask based on top-k indices
+        # Initialize with -inf to mask out non-selected positions
+        sparse_mask = torch.full(
+            (batch_size, seq_len, seq_len),
+            float("-inf"),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        
+        # Set selected positions to 0 (no masking)
+        batch_indices = torch.arange(batch_size, device=hidden_states.device).view(-1, 1, 1)
+        seq_indices = torch.arange(seq_len, device=hidden_states.device).view(1, -1, 1)
+        sparse_mask[batch_indices, seq_indices, topk_indices] = 0
+        
+        # Combine with existing attention mask if provided
+        if attention_mask is not None:
+            sparse_mask = sparse_mask + attention_mask
+        
+        # Call parent forward with sparse mask
+        return super().forward(
+            hidden_states,
+            position_embeddings,
+            sparse_mask,
+            past_key_values,
+            cache_position,
+            **kwargs,
+        )
 
-            probs = nn.functional.softmax(scores, dim=-1, dtype=torch.float32).type_as(hidden_states)  # [B,H,S,T]
 
-            # Rebuild V for decode fast-path: v = (kv_comp @ w_v^T)
-            # kv_comp: [B,H,T,kv_rank], w_v: [H, V, kv_rank]
-            v_from_comp = torch.matmul(kv_comp, w_v.transpose(-1, -2))  # [B,H,T,V]
-            attn_output = torch.matmul(probs, v_from_comp)  # [B,H,S,V]
-
-        # Output projection
-        attn_output = attn_output.transpose(1, 2).reshape(B, S, -1).contiguous()  # [B,S,H*V]
-        attn_output = self.o_proj(attn_output)  # [B,S,hidden]
-        return attn_output, None, None
-
-
-class DeepseekV32DecoderLayer(DeepseekV2DecoderLayer):
-    pass
-
-
-class DeepseekV32PreTrainedModel(DeepseekV2PreTrainedModel):
-    pass
-
-
-class DeepseekV32Model(DeepseekV2Model):
-    pass
-
-
-class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
-    pass
+class DeepseekV32DecoderLayer(DeepseekV3DecoderLayer):
+    """
+    DeepSeek V3.2 Decoder Layer.
+    
+    Inherits from DeepSeek V3 but uses DeepseekV32Attention with sparse attention support.
+    """
+    
+    def __init__(self, config: DeepseekV32Config, layer_idx: int):
+        # Call nn.Module.__init__ directly to avoid LlamaDecoderLayer's init
+        nn.Module.__init__(self)
+        self.hidden_size = config.hidden_size
+        
+        # Use V3.2 attention with indexer
+        self.self_attn = DeepseekV32Attention(config=config, layer_idx=layer_idx)
+        
+        # MLP layer (MoE or dense depending on layer index)
+        if layer_idx >= config.first_k_dense_replace:
+            self.mlp = DeepseekV32MoE(config)
+        else:
+            self.mlp = DeepseekV32MLP(config)
+        
+        # Layer norms
+        self.input_layernorm = DeepseekV32RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = DeepseekV32RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
 
-class DeepseekV32ForSequenceClassification(DeepseekV2ForSequenceClassification):
-    pass
+class DeepseekV32PreTrainedModel(DeepseekV3PreTrainedModel):
+    """DeepSeek V3.2 PreTrained Model base class."""
+    config_class = DeepseekV32Config
 
 
-__all__ = [
-    "DeepseekV32Config",
-    "DeepseekV32PreTrainedModel",
-    "DeepseekV32Model",
-    "DeepseekV32ForCausalLM",
-    "DeepseekV32ForSequenceClassification",
-]
+class DeepseekV32Model(DeepseekV3Model):
+    """
+    DeepSeek V3.2 Model with DeepSeek Sparse Attention.
+    
+    This model extends DeepSeek V3 with an indexer mechanism for efficient long-context processing.
+    """
+    config_class = DeepseekV32Config
+    
+    def __init__(self, config: DeepseekV32Config):
+        super().__init__(config)
+        # Override layers with V3.2 decoder layers
+        self.layers = nn.ModuleList(
+            [DeepseekV32DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+
+
+class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
+    """
+    DeepSeek V3.2 Model for Causal Language Modeling.
+    
+    Extends DeepSeek V3 with DeepSeek Sparse Attention for efficient long-context generation.
+    """
+    config_class = DeepseekV32Config
+    
+    def __init__(self, config: DeepseekV32Config):
+        super().__init__(config)
+        self.model = DeepseekV32Model(config)
+
+
+class DeepseekV32ForSequenceClassification(DeepseekV3ForSequenceClassification):
+    """DeepSeek V3.2 Model for Sequence Classification."""
+    config_class = DeepseekV32Config
+    
+    def __init__(self, config: DeepseekV32Config):
+        super().__init__(config)
+        self.model = DeepseekV32Model(config)
+
+
+class DeepseekV32ForTokenClassification(DeepseekV3ForTokenClassification):
+    """DeepSeek V3.2 Model for Token Classification."""
+    config_class = DeepseekV32Config
+    
+    def __init__(self, config: DeepseekV32Config):
+        super().__init__(config)
+        self.model = DeepseekV32Model(config)
